@@ -22,6 +22,7 @@ from pylabrobot.liquid_handling.liquid_classes.tecan import (
   TecanLiquidClass,
   get_liquid_class,
 )
+from pylabrobot.liquid_handling.utils import get_tight_single_resource_liquid_op_offsets
 from pylabrobot.liquid_handling.standard import (
   Drop,
   DropTipRack,
@@ -293,7 +294,14 @@ class EVOBackend(TecanLiquidHandler):
 
     # Initialize plungers. Assumes wash station assigned at rail 1.
     await self.liha.set_z_travel_height([self._z_range] * self.num_channels)
-    await self.liha.position_absolute_all_axis(45, 1031, 90, [1200] * self.num_channels)
+    # move to wash station
+    wash = self.deck.get_resource("wash_waste")
+    wash_offsets = get_tight_single_resource_liquid_op_offsets(wash, self.num_channels)
+    location = wash.get_absolute_location() + wash.center() + wash_offsets[0]
+    location.x = int(location.x * 10)
+    location.y = int((352 - location.y) * 10)
+    location.z = int(wash.get_size_z() * 10)
+    await self.liha.position_absolute_all_axis(location.x, location.y,90, [location.z] * self.num_channels)
     await self.liha.initialize_plunger(self._bin_use_channels(list(range(self.num_channels))))
     await self.liha.position_valve_logical([1] * self.num_channels)
     await self.liha.move_plunger_relative([100] * self.num_channels)
