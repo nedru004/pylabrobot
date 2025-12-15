@@ -1,460 +1,325 @@
-"""LED music visualizer for Hamilton STAR liquid handlers.
+"""Control Hamilton STAR loading indicator LEDs based on live microphone audio.
 
-This module synchronizes the Hamilton loading indicator LEDs with music by analyzing
-audio in real-time and mapping frequency bands to LED patterns.
+This module provides simple "music visualizer" style light shows for the
+Hamilton loading LEDs using the `set_loading_indicators` command on the
+`STAR` backend. It only uses microphone audio (no files) to avoid
+copyright and format issues.
+
+Typical usage (inside an async context where you already have a connected
+`STAR` backend instance)::
+
+  from pylabrobot.liquid_handling.backends.hamilton.STAR_backend import STAR
+  from pylabrobot.audio.led_music import run_led_music
+
+  backend: STAR = ...  # your connected backend
+  await run_led_music(backend, mode="scroll", duration=30.0)
+
+The helper functions in this module do **not** create or connect a
+`STAR` backend for you; they only drive LEDs on an existing, connected
+backend.
 """
 
+from __future__ import annotations
+
 import asyncio
-import logging
+import math
 import threading
-from typing import List, Optional
+import time
+from dataclasses import dataclass
+from typing import Literal, Sequence
 
-try:
+try:  # optional dependency
   import numpy as np
-
-  NUMPY_AVAILABLE = True
-except ImportError:
-  NUMPY_AVAILABLE = False
-  np = None  # type: ignore
-
-try:
-  import pyaudio
-
-  PYAUDIO_AVAILABLE = True
-except ImportError:
-  PYAUDIO_AVAILABLE = False
-  pyaudio = None  # type: ignore
-
-try:
-  from scipy import signal
-
-  SCIPY_AVAILABLE = True
-except ImportError:
-  SCIPY_AVAILABLE = False
-  signal = None  # type: ignore
-
-try:
-  import pygame
-
-  PYGAME_AVAILABLE = True
-except ImportError:
-  PYGAME_AVAILABLE = False
-  pygame = None  # type: ignore
-
-logger = logging.getLogger(__name__)
+  import sounddevice as sd
+except ImportError as e:  # pragma: no cover - import error path
+  _IMPORT_ERROR = e
+  np = None  # type: ignore[assignment]
+  sd = None  # type: ignore[assignment]
 
 
-class LEDMusicVisualizer:
-  """Visualizes music on Hamilton STAR loading indicator LEDs."""
+LEDMode = Literal["scroll", "random", "vu"]
 
-  def __init__(
-    self,
-    backend,
-    sample_rate: int = 44100,
-    chunk_size: int = 4096,
-    update_rate: float = 30.0,  # Updates per second
-    sensitivity: float = 0.5,  # 0.0 to 1.0, higher = more sensitive
-    use_blink: bool = True,  # Whether to use blinking pattern
-  ):
-    """Initialize the LED music visualizer.
 
-    Args:
-        backend: Hamilton STAR backend instance with set_loading_indicators method
-        sample_rate: Audio sample rate in Hz
-        chunk_size: Number of audio samples per chunk
-        update_rate: How many times per second to update LEDs
-        sensitivity: Sensitivity threshold (0.0-1.0), higher values make LEDs more responsive
-        use_blink: If True, use blinking pattern for higher frequencies
-    """
-    if not NUMPY_AVAILABLE:
-      raise RuntimeError("numpy is required for LED music visualization")
-    if not PYAUDIO_AVAILABLE:
-      raise RuntimeError("pyaudio is required for LED music visualization")
+def _check_audio_deps():
+  if np is None or sd is None:
+    raise RuntimeError(
+      "Microphone LED music requires the 'numpy' and 'sounddevice' packages. "
+      "Install them with: pip install numpy sounddevice"
+    ) from _IMPORT_ERROR
+
+
+@dataclass
+class LEDMusicConfig:
+  """Configuration for LED music visualization."""
+
+  num_leds: int = 54  # Hamilton STAR loading indicators
+  samplerate: int = 44100
+  blocksize: int = 2048
+  update_interval_s: float = 0.05  # how often we update LEDs
+  mode: LEDMode = "scroll"
+  sensitivity: float = (
+    1.0  # global gain on audio level (0.5 = less sensitive, 2.0 = very sensitive)
+  )
+
+  # Simple automatic gain control for volume normalization
+  target_level: float = 0.3
+  level_smoothing: float = 0.2
+
+
+class LEDMusicController:
+  """Drive Hamilton loading LEDs from microphone input.
+
+  The controller:
+  - opens a microphone input stream (using `sounddevice`)
+  - computes a simple loudness estimate for each audio block
+  - maps loudness to LED patterns using different visualization modes
+  - sends patterns to `backend.set_loading_indicators`
+  """
+
+  def __init__(self, backend, *, config: LEDMusicConfig | None = None):
+    _check_audio_deps()
 
     self.backend = backend
-    self.sample_rate = sample_rate
-    self.chunk_size = chunk_size
-    self.update_rate = update_rate
-    self.sensitivity = max(0.0, min(1.0, sensitivity))
-    self.use_blink = use_blink
+    self.config = config or LEDMusicConfig()
 
+    self._level_lock = threading.Lock()
+    self._current_level: float = 0.0
     self._running = False
-    self._audio_thread: Optional[threading.Thread] = None
-    self._update_task: Optional[asyncio.Task] = None
-    self._audio_queue: asyncio.Queue = asyncio.Queue()
-    self._num_leds = 54
+    self._scroll_pos = 0.0
+    self._agc_gain = 1.0
 
-    # Frequency bands: divide audio spectrum into 54 bands
-    # Using logarithmic spacing for better visual representation
-    self._freq_bands = self._create_frequency_bands()
+  # ===== Audio handling =====================================================
 
-  def _create_frequency_bands(self) -> List[tuple]:
-    """Create frequency bands for LED mapping.
+  def _audio_callback(self, indata, frames, time_info, status):  # pragma: no cover - real-time path
+    """Called from sounddevice thread for each audio block."""
+    if status:
+      # We intentionally don't raise here; just ignore glitches.
+      return
 
-    Returns:
-        List of (low_freq, high_freq) tuples for each LED
+    if indata is None or len(indata) == 0:
+      return
+
+    # Collapse to mono and compute RMS level
+    data = np.asarray(indata, dtype=np.float32)
+    if data.ndim > 1:
+      data = data.mean(axis=1)
+
+    rms = float(np.sqrt(np.mean(np.square(data))) + 1e-9)
+
+    # Map RMS into a normalized 0..1 range using a fixed reference level.
+    # This avoids the AGC making everything look "medium loud" and gives
+    # better separation between soft and loud.
+    cfg = self.config
+    ref_level = 0.2  # tilt a bit more sensitive toward softer sounds
+    norm = min(1.0, rms / ref_level)
+
+    # Apply user-configurable sensitivity as a simple linear gain.
+    level = max(0.0, min(1.0, norm * cfg.sensitivity))
+
+    with self._level_lock:
+      # Smooth the public level value
+      self._current_level = (
+        1.0 - cfg.level_smoothing
+      ) * self._current_level + cfg.level_smoothing * level
+
+  def _get_level(self) -> float:
+    with self._level_lock:
+      return float(self._current_level)
+
+  # ===== LED pattern generation ============================================
+
+  def _make_empty_patterns(self) -> tuple[list[bool], list[bool]]:
+    n = self.config.num_leds
+    return [False] * n, [False] * n
+
+  def _pattern_scroll(self, level: float) -> tuple[list[bool], list[bool]]:
+    """Scroll newest audio frame in from the front.
+
+    Interpretation:
+    - LED index 0 = "front" / newest audio frame.
+    - Higher indices = older frames, i.e. history scrolled across the deck.
+
+    On each update:
+    - Shift existing state toward higher indices.
+    - Insert a new "front" state at index 0 based on current level.
     """
-    # Human hearing range: ~20 Hz to 20 kHz
-    # Use logarithmic spacing for better visual representation
-    min_freq = 20.0
-    max_freq = 20000.0
 
-    bands = []
-    for i in range(self._num_leds):
-      # Logarithmic spacing
-      low = min_freq * (max_freq / min_freq) ** (i / self._num_leds)
-      high = min_freq * (max_freq / min_freq) ** ((i + 1) / self._num_leds)
-      bands.append((low, high))
+    n = self.config.num_leds
 
-    return bands
+    # Initialize history on first call.
+    if not hasattr(self, "_scroll_history_bits"):
+      self._scroll_history_bits = [False] * n  # type: ignore[attr-defined]
+      self._scroll_history_blinks = [False] * n  # type: ignore[attr-defined]
 
-  def _analyze_audio_chunk(self, audio_data: np.ndarray) -> tuple[List[bool], List[bool]]:
-    """Analyze audio chunk and return LED patterns.
+    # Shift existing history one step to the right (toward larger indices).
+    bits_prev = list(self._scroll_history_bits)  # type: ignore[attr-defined]
+    blinks_prev = list(self._scroll_history_blinks)  # type: ignore[attr-defined]
 
-    Args:
-        audio_data: Audio samples as numpy array
+    bits_new = [False] * n
+    blinks_new = [False] * n
+    for i in range(n - 1, 0, -1):
+      bits_new[i] = bits_prev[i - 1]
+      blinks_new[i] = blinks_prev[i - 1]
 
-    Returns:
-        Tuple of (bit_pattern, blink_pattern) lists, each of length 54
-    """
-    # Compute FFT
-    fft = np.fft.rfft(audio_data)
-    fft_magnitude = np.abs(fft)
-    freqs = np.fft.rfftfreq(len(audio_data), 1.0 / self.sample_rate)
+    # Determine new "front" LED state (index 0) from current level.
+    # Use probabilistic activation so soft sounds give sparse dots and
+    # loud sounds give dense, continuous bands. Boost sensitivity so
+    # quieter sounds still show up clearly.
+    level_boost = max(0.0, min(1.0, level * 2.5))  # boost sensitivity
+    p_on = level_boost  # probability of turning the new LED on
+    front_on = bool(np.random.rand() < p_on)
+    front_blink = False
 
-    # Normalize magnitude
-    if np.max(fft_magnitude) > 0:
-      fft_magnitude = fft_magnitude / np.max(fft_magnitude)
+    bits_new[0] = front_on
+    blinks_new[0] = front_blink
 
-    # Map frequency bands to LEDs
-    bit_pattern = [False] * self._num_leds
-    blink_pattern = [False] * self._num_leds
+    # Save history for next frame.
+    self._scroll_history_bits = bits_new  # type: ignore[attr-defined]
+    self._scroll_history_blinks = blinks_new  # type: ignore[attr-defined]
 
-    for i, (low_freq, high_freq) in enumerate(self._freq_bands):
-      # Find frequencies in this band
-      mask = (freqs >= low_freq) & (freqs < high_freq)
-      if np.any(mask):
-        # Get average magnitude in this band
-        band_magnitude = np.mean(fft_magnitude[mask])
+    return bits_new, blinks_new
 
-        # Apply sensitivity threshold
-        threshold = 1.0 - self.sensitivity
-        if band_magnitude > threshold:
-          bit_pattern[i] = True
+  def _pattern_random(self, level: float) -> tuple[list[bool], list[bool]]:
+    """Random twinkling pattern, density follows volume."""
+    bit_pattern, blink_pattern = self._make_empty_patterns()
+    n = self.config.num_leds
 
-          # Use blinking for higher frequencies (more dynamic)
-          if self.use_blink and i > self._num_leds // 2:
-            # Blink for upper half of LEDs (higher frequencies)
-            blink_pattern[i] = True
+    # Number of active LEDs ~ volume (quieter → much fewer LEDs)
+    # Use a nonlinear mapping so that near-silence is almost dark.
+    if level < 0.1:
+      num_on = 0
+    else:
+      num_on = int((level**2) * n)
+      num_on = max(1, min(n, num_on))
+    indices = np.random.choice(n, size=num_on, replace=False)
+
+    for idx in indices:
+      bit_pattern[int(idx)] = True
+      # Do not use blink; it updates too slowly to be visually useful.
+      blink_pattern[int(idx)] = False
 
     return bit_pattern, blink_pattern
 
-  async def _update_leds_loop(self):
-    """Main loop for updating LEDs based on audio analysis."""
-    while self._running:
-      try:
-        # Get audio chunk from queue (with timeout)
-        try:
-          audio_data = await asyncio.wait_for(
-            self._audio_queue.get(), timeout=1.0 / self.update_rate
-          )
-        except asyncio.TimeoutError:
-          # No audio data, turn off all LEDs
-          bit_pattern = [False] * self._num_leds
-          blink_pattern = [False] * self._num_leds
-        else:
-          # Analyze audio and get LED patterns
-          bit_pattern, blink_pattern = self._analyze_audio_chunk(audio_data)
+  def _pattern_vu(self, level: float) -> tuple[list[bool], list[bool]]:
+    """VU meter radiating from the center in both directions."""
+    bit_pattern, blink_pattern = self._make_empty_patterns()
+    n = self.config.num_leds
 
-        # Update LEDs
-        await self.backend.set_loading_indicators(bit_pattern, blink_pattern)
+    # Scale so low volumes are visible but loud sounds can still hit
+    # the outer LEDs. Use a slight gain to make full-scale reachable.
+    level_clipped = max(0.0, min(1.0, level))
+    scaled = min(1.0, level_clipped * 1.8)  # 0..1
+    # We fill outward from the center: half the LEDs to each side.
+    half = n // 2
+    num_on_each_side = int(round(scaled * half))
+    num_on_each_side = max(0, min(half, num_on_each_side))
 
-        # Sleep to maintain update rate
-        await asyncio.sleep(1.0 / self.update_rate)
+    center_left = half - 1
+    center_right = half
 
-      except Exception as e:
-        logger.error(f"Error in LED update loop: {e}", exc_info=True)
-        await asyncio.sleep(0.1)
+    for i in range(num_on_each_side):
+      left_idx = center_left - i
+      right_idx = center_right + i
+      if 0 <= left_idx < n:
+        bit_pattern[left_idx] = True
+      if 0 <= right_idx < n:
+        bit_pattern[right_idx] = True
 
-  def _audio_capture_loop(self, stream):
-    """Capture audio from stream and put chunks in queue."""
-    try:
-      while self._running:
-        try:
-          # Read audio data
-          data = stream.read(self.chunk_size, exception_on_overflow=False)
-          audio_array = np.frombuffer(data, dtype=np.int16).astype(np.float32)
-          audio_array = audio_array / 32768.0  # Normalize to [-1, 1]
+    # No blink pattern; blink is too slow to see meaningful changes.
 
-          # Put in queue (non-blocking)
-          try:
-            self._audio_queue.put_nowait(audio_array)
-          except asyncio.QueueFull:
-            # Drop oldest if queue is full
-            try:
-              self._audio_queue.get_nowait()
-              self._audio_queue.put_nowait(audio_array)
-            except asyncio.QueueEmpty:
-              pass
+    return bit_pattern, blink_pattern
 
-        except Exception as e:
-          if self._running:
-            logger.error(f"Error reading audio stream: {e}", exc_info=True)
-          break
-    finally:
-      stream.stop_stream()
-      stream.close()
+  def _make_patterns(self, level: float) -> tuple[list[bool], list[bool]]:
+    mode = self.config.mode
+    if mode == "scroll":
+      return self._pattern_scroll(level)
+    if mode == "random":
+      return self._pattern_random(level)
+    if mode == "vu":
+      return self._pattern_vu(level)
+    # Fallback to VU if unknown mode
+    return self._pattern_vu(level)
 
-  async def start_from_microphone(self):
-    """Start visualization using microphone input.
+  # ===== Public API ========================================================
 
-    This will capture audio from the default microphone and visualize it.
-    """
-    if not self._running:
-      self._running = True
-
-      # Initialize PyAudio
-      p = pyaudio.PyAudio()
-
-      # Open audio stream
-      stream = p.open(
-        format=pyaudio.paInt16,
-        channels=1,  # Mono
-        rate=self.sample_rate,
-        input=True,
-        frames_per_buffer=self.chunk_size,
-      )
-
-      # Start audio capture thread
-      self._audio_thread = threading.Thread(
-        target=self._audio_capture_loop, args=(stream,), daemon=True
-      )
-      self._audio_thread.start()
-
-      # Start LED update task
-      self._update_task = asyncio.create_task(self._update_leds_loop())
-
-      logger.info("LED music visualizer started (microphone input)")
-
-  async def start_from_file(self, audio_file: str, play_audio: bool = True):
-    """Start visualization using audio file.
+  async def run(self, duration: float | None = None):
+    """Run the LED music controller.
 
     Args:
-        audio_file: Path to audio file (mp3, wav, etc.)
-        play_audio: If True, also play the audio through speakers (requires pygame)
+      duration: If provided, run for this many seconds. If ``None``,
+        run until cancelled (e.g. with Ctrl+C or by cancelling the task).
     """
-    if not self._running:
-      self._running = True
 
-      # Play audio if requested
-      if play_audio:
-        if not PYGAME_AVAILABLE:
-          logger.warning("pygame not available, audio will not be played")
-          play_audio = False
-        else:
-          pygame.mixer.init(
-            frequency=self.sample_rate, size=-16, channels=1, buffer=self.chunk_size
-          )
-          pygame.mixer.music.load(audio_file)
-          pygame.mixer.music.play()
+    self._running = True
+    cfg = self.config
 
-      # Analyze file directly (more reliable than capturing system audio)
-      await self._start_from_file_direct(audio_file, play_audio)
+    loop = asyncio.get_running_loop()
 
-  async def _start_from_file_direct(self, audio_file: str, play_audio: bool = False):
-    """Analyze audio file directly and visualize on LEDs.
+    # Open microphone stream; callback runs on a separate thread.
+    stream = sd.InputStream(
+      channels=1,
+      samplerate=cfg.samplerate,
+      blocksize=cfg.blocksize,
+      callback=self._audio_callback,
+    )
 
-    Supports various audio formats through pydub or soundfile.
-    """
+    start = time.monotonic()
+
     try:
-      # Try to load audio using different libraries
-      data = None
-      rate = self.sample_rate
-
-      # Method 1: Try pydub (supports many formats including mp3)
-      try:
-        from pydub import AudioSegment
-
-        audio = AudioSegment.from_file(audio_file)
-        # Convert to numpy array
-        data = np.array(audio.get_array_of_samples(), dtype=np.float32)
-        if audio.channels == 2:
-          # Convert stereo to mono
-          data = data.reshape(-1, 2).mean(axis=1)
-        else:
-          data = data.reshape(-1)
-        # Normalize to [-1, 1]
-        if audio.sample_width == 1:
-          data = data / 128.0 - 1.0
-        elif audio.sample_width == 2:
-          data = data / 32768.0
-        elif audio.sample_width == 4:
-          data = data / 2147483648.0
-        rate = audio.frame_rate
-        logger.info(f"Loaded audio file using pydub: {rate} Hz, {len(data)} samples")
-      except ImportError:
-        logger.debug("pydub not available, trying scipy.io.wavfile")
-      except Exception as e:
-        logger.debug(f"pydub failed: {e}, trying scipy.io.wavfile")
-
-      # Method 2: Try scipy.io.wavfile (WAV only)
-      if data is None:
-        try:
-          from scipy.io import wavfile
-
-          rate, data = wavfile.read(audio_file)
-
-          # Convert to mono if stereo
-          if len(data.shape) > 1:
-            data = np.mean(data, axis=1)
-
-          # Convert to float
-          if data.dtype == np.int16:
-            data = data.astype(np.float32) / 32768.0
-          elif data.dtype == np.int32:
-            data = data.astype(np.float32) / 2147483648.0
-          elif data.dtype == np.uint8:
-            data = data.astype(np.float32) / 128.0 - 1.0
-          else:
-            data = data.astype(np.float32)
-            if np.max(np.abs(data)) > 1.0:
-              data = data / np.max(np.abs(data))
-
-          logger.info(f"Loaded audio file using scipy: {rate} Hz, {len(data)} samples")
-        except ImportError:
-          logger.error("Neither pydub nor scipy available. Cannot load audio file.")
-          raise RuntimeError(
-            "Audio file loading requires either pydub or scipy. "
-            "Install with: pip install pydub scipy"
-          )
-        except Exception as e:
-          logger.error(f"Failed to load audio file: {e}")
-          raise
-
-      # Resample if needed
-      if rate != self.sample_rate:
-        if SCIPY_AVAILABLE:
-          num_samples = int(len(data) * self.sample_rate / rate)
-          data = signal.resample(data, num_samples)
-          logger.info(f"Resampled from {rate} Hz to {self.sample_rate} Hz")
-        else:
-          logger.warning(
-            "scipy not available, cannot resample audio. " "Audio may not sync correctly with LEDs."
-          )
-
-      # Process in chunks
-      chunk_samples = int(self.sample_rate / self.update_rate)
-      logger.info(f"Processing audio: {len(data)} samples in chunks of {chunk_samples}")
-
-      for i in range(0, len(data), chunk_samples):
-        if not self._running:
-          break
-
-        # Check if audio is still playing (if we're playing it)
-        if play_audio and PYGAME_AVAILABLE:
-          if not pygame.mixer.music.get_busy():
+      with stream:
+        while self._running:
+          if duration is not None and time.monotonic() - start >= duration:
             break
 
-        chunk = data[i : i + chunk_samples]
-        if len(chunk) < chunk_samples:
-          # Pad last chunk with zeros
-          chunk = np.pad(chunk, (0, chunk_samples - len(chunk)))
+          level = self._get_level()
+          bit_pattern, blink_pattern = self._make_patterns(level)
 
-        # Analyze and update LEDs
-        bit_pattern, blink_pattern = self._analyze_audio_chunk(chunk)
-        await self.backend.set_loading_indicators(bit_pattern, blink_pattern)
+          # Fire-and-forget; if the loop is busy, we skip rather than block
+          # the audio thread. Errors bubble up through the task.
+          await self.backend.set_loading_indicators(bit_pattern, blink_pattern)
 
-        await asyncio.sleep(1.0 / self.update_rate)
-
-      logger.info("Finished processing audio file")
-
-    except Exception as e:
-      logger.error(f"Error in direct file analysis: {e}", exc_info=True)
+          await asyncio.sleep(cfg.update_interval_s)
     finally:
-      await self.stop()
-
-  async def stop(self):
-    """Stop the visualization."""
-    if self._running:
       self._running = False
 
-      # Stop pygame music if playing
-      if PYGAME_AVAILABLE:
-        try:
-          pygame.mixer.music.stop()
-        except Exception:
-          pass
-
-      # Wait for threads to finish
-      if self._audio_thread is not None:
-        self._audio_thread.join(timeout=1.0)
-
-      # Cancel update task
-      if self._update_task is not None:
-        self._update_task.cancel()
-        try:
-          await self._update_task
-        except asyncio.CancelledError:
-          pass
-
-      # Turn off all LEDs
-      try:
-        bit_pattern = [False] * self._num_leds
-        blink_pattern = [False] * self._num_leds
-        await self.backend.set_loading_indicators(bit_pattern, blink_pattern)
-      except Exception as e:
-        logger.warning(f"Error turning off LEDs: {e}")
-
-      logger.info("LED music visualizer stopped")
+  def stop(self):
+    """Request the controller to stop at the next update tick."""
+    self._running = False
 
 
-async def visualize_music_from_file(
+async def run_led_music(
   backend,
-  audio_file: str,
-  sensitivity: float = 0.5,
-  use_blink: bool = True,
-  play_audio: bool = True,
-):
-  """Convenience function to visualize music from a file.
+  *,
+  mode: LEDMode = "scroll",
+  duration: float | None = None,
+  samplerate: int = 44100,
+  blocksize: int = 2048,
+  update_interval_s: float = 0.05,
+  sensitivity: float = 1.0,
+) -> None:
+  """Convenience helper to run LED music from a microphone.
 
   Args:
-      backend: Hamilton STAR backend instance
-      audio_file: Path to audio file (mp3, wav, etc.)
-      sensitivity: Sensitivity threshold (0.0-1.0)
-      use_blink: Whether to use blinking pattern
-      play_audio: If True, also play audio through speakers (requires pygame)
-
-  Example:
-      >>> from pylabrobot.liquid_handling import LiquidHandler
-      >>> from pylabrobot.liquid_handling.backends.hamilton import STAR
-      >>> from pylabrobot.audio.led_music import visualize_music_from_file
-      >>>
-      >>> backend = STAR()
-      >>> await backend.setup()
-      >>> await visualize_music_from_file(backend, "song.mp3")
+    backend: A connected Hamilton `STAR` backend instance that provides
+      :meth:`set_loading_indicators`.
+    mode: Visualization mode. One of:
+      - ``"scroll"``: scrolling dot with tail, speed and tail follow volume.
+      - ``"random"``: random twinkling, density and blinking follow volume.
+      - ``"vu"``: simple left-to-right VU meter.
+    duration: Number of seconds to run. If ``None``, run until cancelled.
+    samplerate: Microphone sampling rate in Hz.
+    blocksize: Number of samples per audio block.
+    update_interval_s: How often to update LED patterns.
+    sensitivity: Global audio sensitivity (0.5 = less sensitive, 2.0 = very
+      sensitive).
   """
-  visualizer = LEDMusicVisualizer(backend, sensitivity=sensitivity, use_blink=use_blink)
-  await visualizer.start_from_file(audio_file, play_audio=play_audio)
 
-
-async def visualize_music_from_microphone(
-  backend, sensitivity: float = 0.5, use_blink: bool = True
-):
-  """Convenience function to visualize music from microphone.
-
-  Args:
-      backend: Hamilton STAR backend instance
-      sensitivity: Sensitivity threshold (0.0-1.0)
-      use_blink: Whether to use blinking pattern
-
-  Example:
-      >>> from pylabrobot.liquid_handling import LiquidHandler
-      >>> from pylabrobot.liquid_handling.backends.hamilton import STAR
-      >>> from pylabrobot.audio.led_music import visualize_music_from_microphone
-      >>>
-      >>> backend = STAR()
-      >>> await backend.setup()
-      >>> await visualize_music_from_microphone(backend)
-  """
-  visualizer = LEDMusicVisualizer(backend, sensitivity=sensitivity, use_blink=use_blink)
-  await visualizer.start_from_microphone()
+  cfg = LEDMusicConfig(
+    samplerate=samplerate,
+    blocksize=blocksize,
+    update_interval_s=update_interval_s,
+    mode=mode,
+    sensitivity=sensitivity,
+  )
+  controller = LEDMusicController(backend, config=cfg)
+  await controller.run(duration=duration)
