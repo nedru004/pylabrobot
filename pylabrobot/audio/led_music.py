@@ -26,7 +26,7 @@ import math
 import threading
 import time
 from dataclasses import dataclass
-from typing import Literal, Sequence
+from typing import Literal
 
 try:  # optional dependency
   import numpy as np
@@ -60,9 +60,8 @@ class LEDMusicConfig:
   sensitivity: float = (
     1.0  # global gain on audio level (0.5 = less sensitive, 2.0 = very sensitive)
   )
-
-  # Simple automatic gain control for volume normalization
-  target_level: float = 0.3
+  # Smoothing for the level value passed from the audio callback to the
+  # async loop (0 = no smoothing, 1 = very slow response).
   level_smoothing: float = 0.2
 
 
@@ -85,8 +84,7 @@ class LEDMusicController:
     self._level_lock = threading.Lock()
     self._current_level: float = 0.0
     self._running = False
-    self._scroll_pos = 0.0
-    self._agc_gain = 1.0
+    self._update_task: asyncio.Task | None = None
 
   # ===== Audio handling =====================================================
 
@@ -253,8 +251,6 @@ class LEDMusicController:
     self._running = True
     cfg = self.config
 
-    loop = asyncio.get_running_loop()
-
     # Open microphone stream; callback runs on a separate thread.
     stream = sd.InputStream(
       channels=1,
@@ -274,13 +270,32 @@ class LEDMusicController:
           level = self._get_level()
           bit_pattern, blink_pattern = self._make_patterns(level)
 
-          # Fire-and-forget; if the loop is busy, we skip rather than block
-          # the audio thread. Errors bubble up through the task.
-          await self.backend.set_loading_indicators(bit_pattern, blink_pattern)
+          # Fire-and-forget LED updates. If a previous update is still in flight,
+          # skip this one to avoid queueing up slow network calls. This keeps
+          # the visualizer responsive even if the Hamilton device is slow.
+          if self._update_task is None or self._update_task.done():
+
+            async def _send_update():
+              try:
+                await asyncio.wait_for(
+                  self.backend.set_loading_indicators(bit_pattern, blink_pattern),
+                  timeout=0.5,  # timeout after 500ms to prevent hanging
+                )
+              except (asyncio.TimeoutError, Exception):
+                # Silently ignore timeouts/errors; we'll try again next frame
+                pass
+
+            self._update_task = asyncio.create_task(_send_update())
 
           await asyncio.sleep(cfg.update_interval_s)
     finally:
       self._running = False
+      # Wait for any in-flight update to complete
+      if self._update_task is not None and not self._update_task.done():
+        try:
+          await asyncio.wait_for(self._update_task, timeout=1.0)
+        except (asyncio.TimeoutError, Exception):
+          self._update_task.cancel()
 
   def stop(self):
     """Request the controller to stop at the next update tick."""
@@ -309,7 +324,9 @@ async def run_led_music(
     duration: Number of seconds to run. If ``None``, run until cancelled.
     samplerate: Microphone sampling rate in Hz.
     blocksize: Number of samples per audio block.
-    update_interval_s: How often to update LED patterns.
+    update_interval_s: How often to update LED patterns. If updates feel slow,
+      try reducing this (e.g., 0.02 for 50 Hz). Note: very fast rates may be
+      limited by network latency to the Hamilton device.
     sensitivity: Global audio sensitivity (0.5 = less sensitive, 2.0 = very
       sensitive).
   """
